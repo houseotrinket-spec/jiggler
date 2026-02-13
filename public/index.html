@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Jiggler</title>
+</head>
+<body>
+  <h2>Jiggler</h2>
+  <textarea id="input" rows="15" cols="80" placeholder="Enter product names or URLs"></textarea>
+  <br><br>
+  <button onclick="resolve()">Resolve</button>
+  <button onclick="downloadCSV()">Export CSV</button>
+
+  <pre id="output"></pre>
+
+<script>
+let currentData = []
+
+async function resolve() {
+  const inputs = document.getElementById("input").value
+    .split("\n")
+    .map(i => i.trim())
+    .filter(Boolean)
+
+  const res = await fetch("/resolve", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ inputs })
+  })
+
+  currentData = await res.json()
+  document.getElementById("output").textContent =
+    JSON.stringify(currentData, null, 2)
+}
+
+function downloadCSV() {
+  if (!currentData.length) return
+
+  const headers = [
+    "BigCommerce Product ID",
+    "Searchspring ID",
+    "Product Name",
+    "Product URL",
+    "Cart Link",
+    "Hashed ID",
+    "Hashed URL",
+    "SKU",
+    "Price",
+    "Image",
+    "Variant Data"
+  ]
+
+  const rows = currentData.map(p => [
+    p.numericProductId,
+    p.searchspringId,
+    p.name,
+    p.productUrl,
+    p.finalCart,
+    p.hashedId,
+    p.hashedUrl,
+    p.sku,
+    p.price,
+    p.image,
+    JSON.stringify(p.variants)
+  ])
+
+  const csv =
+    [headers, ...rows]
+      .map(r => r.map(x => `"${x || ""}"`).join(","))
+      .join("\n")
+
+  const blob = new Blob([csv], { type: "text/csv" })
+  const url = URL.createObjectURL(blob)
+
+  const a = document.createElement("a")
+  a.href = url
+  a.download = "jiggler-export.csv"
+  a.click()
+}
+</script>
+</body>
+</html>
