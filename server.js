@@ -1,235 +1,273 @@
-import express from "express"
-import axios from "axios"
-import * as cheerio from "cheerio"
-import crypto from "crypto"
-import nodemailer from "nodemailer"
-import pLimit from "p-limit"
-import { Low } from "lowdb"
-import { JSONFile } from "lowdb/node"
+import express from "express";
+import axios from "axios";
+import crypto from "crypto";
+import fs from "fs";
+import { Parser } from "json2csv";
+import path from "path";
+import { fileURLToPath } from "url";
+import * as cheerio from "cheerio";
+import nodemailer from "nodemailer";
 
-const app = express()
-app.use(express.json())
-app.use(express.static("public"))
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-const limit = pLimit(6)
-const POLL_INTERVAL = 5 * 60 * 1000
-const EMAIL_TO = "houseotrinket@gmail.com"
+const app = express();
+app.use(express.json());
+app.use(express.static("public"));
 
-/* ================= DATABASE ================= */
+const PORT = process.env.PORT || 3000;
 
-const adapter = new JSONFile("db.json")
-const db = new Low(adapter, { products: [] })
-await db.read()
+const SEARCHSPRING_SITE_ID = "bmcyq0";
+const SEARCHSPRING_INSTANCE = "bmcyq0";
+const DATA_FILE = "./products.json";
 
-/* ================= EMAIL ================= */
+const POLL_INTERVAL = 5 * 60 * 1000; // 5 minutes
+
+let productStore = {};
+let trackedInputs = [];
+
+if (fs.existsSync(DATA_FILE)) {
+  productStore = JSON.parse(fs.readFileSync(DATA_FILE));
+}
+
+function saveStore() {
+  fs.writeFileSync(DATA_FILE, JSON.stringify(productStore, null, 2));
+}
+
+function md5(value) {
+  return crypto.createHash("md5").update(value.toString()).digest("hex");
+}
+
+function extractProductId(input) {
+  if (!input) return null;
+
+  const cartMatch = input.match(/product_id=(\d+)/);
+  if (cartMatch) return cartMatch[1];
+
+  const imageMatch = input.match(/\/products\/(\d+)\//);
+  if (imageMatch) return imageMatch[1];
+
+  if (/^\d+$/.test(input)) return input;
+
+  return null;
+}
+
+/* ================= EMAIL ALERT ================= */
 
 const transporter = nodemailer.createTransport({
   service: "gmail",
   auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS
+    user: process.env.ALERT_EMAIL,
+    pass: process.env.GMAIL_APP_PASSWORD
   }
-})
+});
 
-async function sendEmail(subject, body) {
+async function sendAlert(subject, text) {
+  if (!process.env.ALERT_EMAIL) return;
+
   await transporter.sendMail({
-    from: process.env.EMAIL_USER,
-    to: EMAIL_TO,
+    from: process.env.ALERT_EMAIL,
+    to: process.env.ALERT_EMAIL,
     subject,
-    text: body
-  })
+    text
+  });
 }
 
-/* ================= HELPERS ================= */
+/* ================= Searchspring ================= */
 
-function md5(str) {
-  return crypto.createHash("md5").update(str).digest("hex")
-}
+async function fetchProduct(identifier) {
+  const searchUrl = `https://${SEARCHSPRING_INSTANCE}.a.searchspring.io/api/search/search.json?siteId=${SEARCHSPRING_SITE_ID}&q=${encodeURIComponent(identifier)}&resultsFormat=native&page=1&size=5`;
 
-function extractProductIdFromCart(url) {
-  const match = url.match(/product_id=([^&]+)/)
-  return match ? match[1] : null
-}
-
-/* ================= SEARCHSPRING ================= */
-
-async function searchspringLookup(query) {
   try {
-    const res = await axios.get(
-      `https://bmcyq0.a.searchspring.io/api/search/search.json`,
-      { params: { siteId: "bmcyq0", q: query, resultsFormat: "native" } }
-    )
-    return res.data?.results?.[0] || null
-  } catch {
-    return null
-  }
-}
+    const res = await axios.get(searchUrl);
+    const results = res.data.results || [];
+    if (!results.length) return null;
 
-/* ================= BIGCOMMERCE DIRECT ================= */
+    const item = results[0];
 
-async function bigcommerceLookup(id) {
-  try {
-    const res = await axios.get(
-      `https://us.jellycat.com/api/storefront/products/${id}`
-    )
-    return res.data || null
-  } catch {
-    return null
-  }
-}
+    const searchspringId = item.id;
+    const productUrl = item.url;
+    const name = item.name;
+    const price = item.price;
+    const sku = item.sku;
+    const availability = item.available ? "in_stock" : "out_of_stock";
+    const inventory = item.inventory || 0;
 
-/* ================= PAGE SCRAPER ================= */
-
-async function scrapeProductPage(url) {
-  try {
-    const res = await axios.get(url)
-    const $ = cheerio.load(res.data)
-
-    const pageJson = JSON.parse(
-      $("#__NEXT_DATA__").html() || "{}"
-    )
-
-    const product =
-      pageJson?.props?.pageProps?.product ||
-      pageJson?.props?.initialProps?.pageProps?.product
-
-    if (!product) return null
+    const htmlData = await fetchBigCommerceHTML(productUrl);
 
     return {
-      numericProductId: product.entityId,
-      name: product.name,
-      sku: product.sku,
-      price: product.prices?.price?.value || 0,
-      image:
-        product.defaultImage?.urlOriginal ||
-        product.images?.[0]?.urlOriginal ||
-        "",
-      variants: (product.variants || []).map(v => ({
-        variantId: v.entityId,
-        sku: v.sku,
-        inventory: v.inventory?.aggregated?.availableToSell || 0
-      }))
+      searchspringId,
+      name,
+      productUrl,
+      price,
+      sku,
+      availability,
+      inventory,
+      ...htmlData
+    };
+
+  } catch (err) {
+    console.error("Searchspring error:", err.message);
+    return null;
+  }
+}
+
+/* ================= HTML PARSER ================= */
+
+async function fetchBigCommerceHTML(productUrl) {
+  try {
+    const res = await axios.get(productUrl, {
+      headers: { "User-Agent": "Mozilla/5.0" }
+    });
+
+    const html = res.data;
+    const $ = cheerio.load(html);
+
+    let bcEntityId = null;
+    let bcApiId = null;
+    let variants = [];
+
+    $("script").each((i, el) => {
+      const scriptText = $(el).html();
+      if (scriptText && scriptText.includes("entityId")) {
+        try {
+          const match = scriptText.match(/\{.*"entityId":.*\}/s);
+          if (match) {
+            const parsed = JSON.parse(match[0]);
+            bcEntityId = parsed.entityId;
+            bcApiId = parsed.id;
+
+            if (parsed.variants) {
+              variants = parsed.variants.map(v => ({
+                variantEntityId: v.entityId,
+                variantApiId: v.id,
+                sku: v.sku,
+                inventory: v.inventory
+              }));
+            }
+          }
+        } catch {}
+      }
+    });
+
+    const images = [];
+    $("img").each((i, el) => {
+      const src = $(el).attr("src");
+      if (src && src.includes("cdn11.bigcommerce.com")) {
+        images.push(src.split("?")[0]);
+      }
+    });
+
+    return {
+      bigcommerceEntityId: bcEntityId,
+      bigcommerceApiId: bcApiId,
+      variants,
+      images: [...new Set(images)]
+    };
+
+  } catch (err) {
+    console.error("HTML fetch error:", err.message);
+    return {};
+  }
+}
+
+/* ================= PROCESSOR ================= */
+
+async function processInput(input) {
+  const productId = extractProductId(input);
+  const identifier = productId || input;
+
+  const data = await fetchProduct(identifier);
+  if (!data) return null;
+
+  const now = new Date().toISOString();
+  const key = data.bigcommerceEntityId;
+
+  if (!productStore[key]) {
+    productStore[key] = {
+      firstSeenAvailable: data.inventory > 0 ? now : null,
+      lastSeenAvailable: data.inventory > 0 ? now : null,
+      previousInventory: data.inventory,
+      variants: {}
+    };
+
+    await sendAlert(
+      "New Product Added",
+      `${data.name} is now being tracked.`
+    );
+  } else {
+    const record = productStore[key];
+
+    if (record.previousInventory === 0 && data.inventory > 0) {
+      await sendAlert(
+        "Product Restocked",
+        `${data.name} is back in stock.`
+      );
     }
-  } catch {
-    return null
-  }
-}
 
-/* ================= HYBRID RESOLVER ================= */
-
-async function resolveInput(input) {
-  let numericProductId = null
-  let productUrl = null
-
-  if (/^\d+$/.test(input)) {
-    numericProductId = input
-  }
-
-  if (input.includes("cart.php")) {
-    numericProductId = extractProductIdFromCart(input)
-  }
-
-  if (input.includes("jellycat.com") && !input.includes("cart.php")) {
-    productUrl = input
-  }
-
-  // Run lookups in parallel
-  const [ssResult, bcResult] = await Promise.all([
-    searchspringLookup(input),
-    numericProductId ? bigcommerceLookup(numericProductId) : null
-  ])
-
-  if (ssResult?.url) {
-    productUrl = "https://us.jellycat.com" + ssResult.url
-  }
-
-  if (!productUrl && bcResult?.custom_url?.url) {
-    productUrl = "https://us.jellycat.com" + bcResult.custom_url.url
-  }
-
-  if (!productUrl) return null
-
-  const scraped = await scrapeProductPage(productUrl)
-  if (!scraped) return null
-
-  const merged = {
-    ...scraped,
-    searchspringId: ssResult?.id || null,
-    searchspringProductId: ssResult?.uid || null,
-    bigcommerceApiId: bcResult?.id || null,
-    productUrl,
-    hashedId: md5(scraped.numericProductId.toString())
-  }
-
-  const exists = db.data.products.find(
-    p => p.numericProductId === merged.numericProductId
-  )
-
-  if (!exists) {
-    db.data.products.push({
-      ...merged,
-      firstSeen: Date.now(),
-      lastSeen: Date.now()
-    })
-    await db.write()
-  }
-
-  return merged
-}
-
-/* ================= POLLER ================= */
-
-async function checkProduct(product) {
-  const fresh = await scrapeProductPage(product.productUrl)
-  if (!fresh) return
-
-  const existing = db.data.products.find(
-    p => p.numericProductId === product.numericProductId
-  )
-
-  existing.lastSeen = Date.now()
-
-  for (const freshVar of fresh.variants) {
-    const oldVar = existing.variants.find(
-      v => v.variantId === freshVar.variantId
-    )
-
-    if (oldVar?.inventory === 0 && freshVar.inventory > 0) {
-      await sendEmail(
-        "🔁 Restock Alert",
-        `${fresh.name}\nSKU: ${freshVar.sku}\n${product.productUrl}`
-      )
+    record.previousInventory = data.inventory;
+    if (data.inventory > 0) {
+      record.lastSeenAvailable = now;
     }
   }
 
-  existing.variants = fresh.variants
-  existing.price = fresh.price
-  existing.image = fresh.image
+  saveStore();
 
-  await db.write()
+  return {
+    "Searchspring ID": data.searchspringId,
+    "BigCommerce Entity ID": data.bigcommerceEntityId,
+    "BigCommerce API ID": data.bigcommerceApiId,
+    "Product Name": data.name,
+    "Product Page URL": data.productUrl,
+    "Cart Link": `https://us.jellycat.com/cart.php?action=add&product_id=${data.bigcommerceEntityId}`,
+    "BigCommerce Images (JSON)": JSON.stringify(data.images),
+    "Hashed URL": md5(`https://us.jellycat.com/cart.php?action=add&product_id=${data.bigcommerceEntityId}`),
+    "SKU": data.sku,
+    "Variants (JSON)": JSON.stringify(data.variants),
+    "Availability": data.availability,
+    "Inventory": data.inventory,
+    "Price": data.price
+  };
 }
 
-async function pollAll() {
-  const products = [...db.data.products]
-  await Promise.all(products.map(p => limit(() => checkProduct(p))))
+/* ================= POLLING ================= */
+
+async function pollProducts() {
+  if (!trackedInputs.length) return;
+
+  console.log("Polling products...");
+  for (const input of trackedInputs) {
+    await processInput(input);
+  }
 }
 
-setInterval(pollAll, POLL_INTERVAL)
+setInterval(pollProducts, POLL_INTERVAL);
 
 /* ================= ROUTES ================= */
 
-app.post("/resolve-add", async (req, res) => {
-  const { inputs } = req.body
-  const results = await Promise.all(
-    inputs.map(i => limit(() => resolveInput(i)))
-  )
-  res.json(results.filter(Boolean))
-})
+app.post("/resolve", async (req, res) => {
+  const { inputs } = req.body;
+  if (!Array.isArray(inputs))
+    return res.status(400).json({ error: "Provide array of inputs" });
 
-app.get("/products", (req, res) => {
-  res.json(db.data.products)
-})
+  trackedInputs.push(...inputs);
 
-app.listen(process.env.PORT || 3000, () =>
-  console.log("Jiggler Enterprise Hybrid Running")
-)
+  const promises = inputs.map(input => processInput(input));
+  const results = (await Promise.all(promises)).filter(Boolean);
+
+  res.json(results);
+});
+
+app.get("/export-csv", (req, res) => {
+  const fields = Object.keys(productStore[Object.keys(productStore)[0]] || {});
+  const parser = new Parser({ fields });
+  const csv = parser.parse(Object.values(productStore));
+
+  res.header("Content-Type", "text/csv");
+  res.attachment("products.csv");
+  res.send(csv);
+});
+
+app.listen(PORT, () => {
+  console.log(`Jiggler running on port ${PORT}`);
+});
