@@ -1,71 +1,133 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <title>Jiggler</title>
+  <title>Jiggler Dashboard</title>
+  <style>
+    body { font-family: Arial; margin: 40px; background:#f5f5f5; }
+    textarea { width: 100%; height: 120px; }
+    button { padding: 10px 15px; margin: 5px 0; cursor:pointer; }
+    table { border-collapse: collapse; width: 100%; margin-top:20px; background:white;}
+    th, td { border: 1px solid #ddd; padding: 8px; font-size:12px;}
+    th { background: #222; color: white; }
+    tr:nth-child(even) { background:#f2f2f2; }
+    .section { background:white; padding:20px; margin-bottom:30px; border-radius:6px;}
+  </style>
 </head>
 <body>
-  <h2>Jiggler</h2>
-  <textarea id="input" rows="15" cols="80" placeholder="Enter product names or URLs"></textarea>
-  <br><br>
-  <button onclick="resolve()">Resolve</button>
-  <button onclick="downloadCSV()">Export CSV</button>
 
+<h1>Jiggler Inventory Monitor</h1>
+
+<div class="section">
+  <h3>Add / Resolve Products</h3>
+  <textarea id="input" placeholder="Paste product ID, cart URL, product URL, etc (one per line)"></textarea>
+  <br>
+  <button onclick="resolveAdd()">Resolve & Add</button>
+  <button onclick="runPoll()">Run Poll Now</button>
+  <button onclick="exportCSV()">Export CSV</button>
+  <p id="status"></p>
+</div>
+
+<div class="section">
+  <h3>Resolved Output</h3>
   <pre id="output"></pre>
+</div>
+
+<div class="section">
+  <h3>Tracked Products</h3>
+  <div id="productsTable"></div>
+</div>
 
 <script>
-let currentData = []
+let resolvedData = []
+let dbProducts = []
 
-async function resolve() {
+async function resolveAdd() {
   const inputs = document.getElementById("input").value
     .split("\n")
     .map(i => i.trim())
     .filter(Boolean)
 
-  const res = await fetch("/resolve", {
+  if (!inputs.length) return
+
+  document.getElementById("status").innerText = "Resolving..."
+
+  const res = await fetch("/resolve-add", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ inputs })
   })
 
-  currentData = await res.json()
+  resolvedData = await res.json()
+
   document.getElementById("output").textContent =
-    JSON.stringify(currentData, null, 2)
+    JSON.stringify(resolvedData, null, 2)
+
+  document.getElementById("status").innerText = "Done"
+
+  loadProducts()
 }
 
-function downloadCSV() {
-  if (!currentData.length) return
+async function loadProducts() {
+  const res = await fetch("/products")
+  dbProducts = await res.json()
+
+  let html = `<table>
+    <tr>
+      <th>Product ID</th>
+      <th>Name</th>
+      <th>Price</th>
+      <th>Variants</th>
+      <th>URL</th>
+    </tr>`
+
+  dbProducts.forEach(p => {
+    html += `
+      <tr>
+        <td>${p.numericProductId}</td>
+        <td>${p.name}</td>
+        <td>${p.price}</td>
+        <td>${p.variants.length}</td>
+        <td><a href="${p.url}" target="_blank">View</a></td>
+      </tr>
+    `
+  })
+
+  html += "</table>"
+  document.getElementById("productsTable").innerHTML = html
+}
+
+function exportCSV() {
+  if (!dbProducts.length) return
 
   const headers = [
-    "BigCommerce Product ID",
-    "Searchspring ID",
-    "Product Name",
-    "Product URL",
-    "Cart Link",
-    "Hashed ID",
-    "Hashed URL",
-    "SKU",
+    "Product ID",
+    "Name",
     "Price",
-    "Image",
-    "Variant Data"
+    "URL",
+    "Variant ID",
+    "Variant SKU",
+    "Inventory"
   ]
 
-  const rows = currentData.map(p => [
-    p.numericProductId,
-    p.searchspringId,
-    p.name,
-    p.productUrl,
-    p.finalCart,
-    p.hashedId,
-    p.hashedUrl,
-    p.sku,
-    p.price,
-    p.image,
-    JSON.stringify(p.variants)
-  ])
+  const rows = []
+
+  dbProducts.forEach(p => {
+    p.variants.forEach(v => {
+      rows.push([
+        p.numericProductId,
+        p.name,
+        p.price,
+        p.url,
+        v.variantId,
+        v.sku,
+        v.inventory
+      ])
+    })
+  })
 
   const csv =
     [headers, ...rows]
-      .map(r => r.map(x => `"${x || ""}"`).join(","))
+      .map(r => r.map(x => `"${x}"`).join(","))
       .join("\n")
 
   const blob = new Blob([csv], { type: "text/csv" })
@@ -73,9 +135,18 @@ function downloadCSV() {
 
   const a = document.createElement("a")
   a.href = url
-  a.download = "jiggler-export.csv"
+  a.download = "jiggler_inventory.csv"
   a.click()
 }
+
+async function runPoll() {
+  document.getElementById("status").innerText = "Running poll..."
+  await fetch("/products") // triggers backend interval already running
+  document.getElementById("status").innerText = "Poll triggered"
+}
+
+loadProducts()
 </script>
+
 </body>
 </html>
