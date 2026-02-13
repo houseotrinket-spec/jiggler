@@ -11,7 +11,7 @@ const app = express()
 app.use(express.json())
 app.use(express.static("public"))
 
-const limit = pLimit(5)
+const limit = pLimit(6)
 const POLL_INTERVAL = 5 * 60 * 1000
 const EMAIL_TO = "houseotrinket@gmail.com"
 
@@ -51,21 +51,34 @@ function extractProductIdFromCart(url) {
   return match ? match[1] : null
 }
 
-function extractNumericIdFromImage(url) {
-  const match = url.match(/products\/(\d+)\//)
-  return match ? match[1] : null
-}
+/* ================= SEARCHSPRING ================= */
 
-async function fetchSearchspring(productId) {
+async function searchspringLookup(query) {
   try {
     const res = await axios.get(
-      `https://bmcyq0.a.searchspring.io/api/search/search.json?siteId=bmcyq0&q=${productId}&resultsFormat=native`
+      `https://bmcyq0.a.searchspring.io/api/search/search.json`,
+      { params: { siteId: "bmcyq0", q: query, resultsFormat: "native" } }
     )
     return res.data?.results?.[0] || null
   } catch {
     return null
   }
 }
+
+/* ================= BIGCOMMERCE DIRECT ================= */
+
+async function bigcommerceLookup(id) {
+  try {
+    const res = await axios.get(
+      `https://us.jellycat.com/api/storefront/products/${id}`
+    )
+    return res.data || null
+  } catch {
+    return null
+  }
+}
+
+/* ================= PAGE SCRAPER ================= */
 
 async function scrapeProductPage(url) {
   try {
@@ -76,23 +89,22 @@ async function scrapeProductPage(url) {
       $("#__NEXT_DATA__").html() || "{}"
     )
 
-    const productData =
+    const product =
       pageJson?.props?.pageProps?.product ||
       pageJson?.props?.initialProps?.pageProps?.product
 
-    if (!productData) return null
+    if (!product) return null
 
     return {
-      numericProductId: productData.entityId,
-      name: productData.name,
-      price: productData.prices?.price?.value || 0,
-      sku: productData.sku || "",
+      numericProductId: product.entityId,
+      name: product.name,
+      sku: product.sku,
+      price: product.prices?.price?.value || 0,
       image:
-        productData.defaultImage?.urlOriginal ||
-        productData.images?.[0]?.urlOriginal ||
+        product.defaultImage?.urlOriginal ||
+        product.images?.[0]?.urlOriginal ||
         "",
-      url,
-      variants: (productData.variants || []).map(v => ({
+      variants: (product.variants || []).map(v => ({
         variantId: v.entityId,
         sku: v.sku,
         inventory: v.inventory?.aggregated?.availableToSell || 0
@@ -103,73 +115,89 @@ async function scrapeProductPage(url) {
   }
 }
 
-/* ================= RESOLVER ================= */
+/* ================= HYBRID RESOLVER ================= */
 
 async function resolveInput(input) {
-  let productUrl = null
   let numericProductId = null
+  let productUrl = null
+
+  if (/^\d+$/.test(input)) {
+    numericProductId = input
+  }
 
   if (input.includes("cart.php")) {
     numericProductId = extractProductIdFromCart(input)
-  }
-
-  if (input.includes("/products/")) {
-    numericProductId = extractNumericIdFromImage(input)
   }
 
   if (input.includes("jellycat.com") && !input.includes("cart.php")) {
     productUrl = input
   }
 
-  if (!productUrl && numericProductId) {
-    const ss = await fetchSearchspring(numericProductId)
-    if (ss?.url) {
-      productUrl = "https://us.jellycat.com" + ss.url
-    }
+  // Run lookups in parallel
+  const [ssResult, bcResult] = await Promise.all([
+    searchspringLookup(input),
+    numericProductId ? bigcommerceLookup(numericProductId) : null
+  ])
+
+  if (ssResult?.url) {
+    productUrl = "https://us.jellycat.com" + ssResult.url
+  }
+
+  if (!productUrl && bcResult?.custom_url?.url) {
+    productUrl = "https://us.jellycat.com" + bcResult.custom_url.url
   }
 
   if (!productUrl) return null
 
-  const product = await scrapeProductPage(productUrl)
-  if (!product) return null
+  const scraped = await scrapeProductPage(productUrl)
+  if (!scraped) return null
 
-  const existing = db.data.products.find(
-    p => p.numericProductId === product.numericProductId
+  const merged = {
+    ...scraped,
+    searchspringId: ssResult?.id || null,
+    searchspringProductId: ssResult?.uid || null,
+    bigcommerceApiId: bcResult?.id || null,
+    productUrl,
+    hashedId: md5(scraped.numericProductId.toString())
+  }
+
+  const exists = db.data.products.find(
+    p => p.numericProductId === merged.numericProductId
   )
 
-  if (!existing) {
+  if (!exists) {
     db.data.products.push({
-      ...product,
+      ...merged,
       firstSeen: Date.now(),
       lastSeen: Date.now()
     })
     await db.write()
   }
 
-  return product
+  return merged
 }
 
 /* ================= POLLER ================= */
 
 async function checkProduct(product) {
-  const fresh = await scrapeProductPage(product.url)
+  const fresh = await scrapeProductPage(product.productUrl)
   if (!fresh) return
 
   const existing = db.data.products.find(
-    p => p.numericProductId === fresh.numericProductId
+    p => p.numericProductId === product.numericProductId
   )
 
   existing.lastSeen = Date.now()
 
-  for (const freshVariant of fresh.variants) {
-    const oldVariant = existing.variants.find(
-      v => v.variantId === freshVariant.variantId
+  for (const freshVar of fresh.variants) {
+    const oldVar = existing.variants.find(
+      v => v.variantId === freshVar.variantId
     )
 
-    if (oldVariant?.inventory === 0 && freshVariant.inventory > 0) {
+    if (oldVar?.inventory === 0 && freshVar.inventory > 0) {
       await sendEmail(
         "🔁 Restock Alert",
-        `${fresh.name}\nSKU: ${freshVariant.sku}\n${fresh.url}`
+        `${fresh.name}\nSKU: ${freshVar.sku}\n${product.productUrl}`
       )
     }
   }
@@ -203,5 +231,5 @@ app.get("/products", (req, res) => {
 })
 
 app.listen(process.env.PORT || 3000, () =>
-  console.log("Jiggler Running")
+  console.log("Jiggler Enterprise Hybrid Running")
 )
